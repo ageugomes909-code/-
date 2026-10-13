@@ -14,14 +14,24 @@ app.use((req, res, next) => {
   next();
 });
 
+// ============================================================
+// ====================== CONFIGURAÇÕES =======================
+// ============================================================
 const DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1550274953092268122/FSFIL0HInyozWv2wdWIMwh0e54taYrVFjjLm9QcCaMZyE-TtUOrk2hPXaHkopgZLgP2j";
 const APK_URL = "https://www.mediafire.com/file/ogry5nqdr2c1vpd/SHOPICA.apk/file";
 const FIREBASE_DB_URL = "https://loja-do-dag-default-rtdb.firebaseio.com";
 
+// ============================================================
+// ====================== ESTADO GLOBAL =======================
+// ============================================================
 const sessionKeys   = new Map();
 const sessionTokens = new Map();
 const keyCache      = new Map();
+const CACHE_TTL     = 1000;
 
+// ============================================================
+// ====================== UTILITÁRIOS =========================
+// ============================================================
 function getClientIp(req) {
   let ip = req.headers['cf-connecting-ip'] ||
            req.headers['x-forwarded-for'] ||
@@ -69,6 +79,9 @@ function destroySession(req) {
   sessionKeys.delete(ip);
 }
 
+// ============================================================
+// ====================== FIREBASE ============================
+// ============================================================
 function fbRequest(method, path, bodyData) {
   return new Promise((resolve) => {
     let urlData;
@@ -106,9 +119,87 @@ async function firebaseGet(path) {
   return r.data;
 }
 
+async function firebasePatch(path, bodyData) {
+  return await fbRequest('PATCH', path, bodyData);
+}
+
+// ============================================================
+// ====================== HELPERS DE KEY ======================
+// ============================================================
 function normalizeStatus(s) { return String(s || '').toLowerCase().trim(); }
+function toNumber(v, def = 0) { const n = Number(v); return Number.isFinite(n) ? n : def; }
 function invalidateKeyCache(key) { if (key) keyCache.delete(key.trim().toUpperCase()); }
 
+// Lógica completa de verificação e ativação com suporte a duração/expiração
+async function checkKeyStatus(keyInput, clientIp, opts) {
+  opts = opts || {};
+  const skipDevice = !!opts.skipDeviceCheck;
+
+  if (!keyInput) return { status: 'not_found' };
+  const cleanKey = String(keyInput).trim().toUpperCase();
+  const now = Date.now();
+
+  const cached = keyCache.get(cleanKey);
+  if (cached && (now - cached.timestamp < CACHE_TTL)) {
+    if (!skipDevice && cached.usedByIp && cached.usedByIp !== clientIp) return { status: 'ip_locked' };
+    return { status: cached.status };
+  }
+
+  let keyData = await firebaseGet(`/proxyAndroid/keys/${cleanKey}`);
+  if (!keyData || typeof keyData !== 'object') {
+    keyCache.set(cleanKey, { status: 'not_found', timestamp: now });
+    return { status: 'not_found' };
+  }
+
+  let st = normalizeStatus(keyData.status);
+  const durationMs = toNumber(keyData.durationMs, 0);
+  let expiresAt = toNumber(keyData.expiresAt, 0);
+
+  if (st === 'expired' && expiresAt <= 0) {
+    await firebasePatch(`/proxyAndroid/keys/${cleanKey}`, { status: 'criada', expiresAt: null, activatedAt: null, usedByIp: null });
+    keyData = await firebaseGet(`/proxyAndroid/keys/${cleanKey}`) || keyData;
+    st = 'criada'; expiresAt = 0;
+  }
+  if (st === 'expired' && expiresAt > 0 && now <= expiresAt) {
+    await firebasePatch(`/proxyAndroid/keys/${cleanKey}`, { status: 'active' });
+    st = 'active';
+  }
+  if (st === 'paused') {
+    keyCache.set(cleanKey, { status: 'paused', timestamp: now });
+    return { status: 'paused' };
+  }
+  if (expiresAt > 0 && now > expiresAt) {
+    keyCache.set(cleanKey, { status: 'expired', timestamp: now });
+    return { status: 'expired' };
+  }
+  if (!skipDevice && keyData.usedByIp && keyData.usedByIp !== clientIp) {
+    keyCache.set(cleanKey, { status: 'ip_locked', timestamp: now, usedByIp: keyData.usedByIp });
+    return { status: 'ip_locked' };
+  }
+  if (st === 'active' || st === 'criada') {
+    const updatePayload = {};
+    if (st === 'criada') {
+      updatePayload.status = 'active';
+      updatePayload.activatedAt = now;
+      if (durationMs > 0) updatePayload.expiresAt = now + durationMs;
+    } else if (st === 'active' && expiresAt <= 0 && durationMs > 0) {
+      updatePayload.expiresAt = now + durationMs;
+      if (!keyData.activatedAt) updatePayload.activatedAt = now;
+    }
+    if (!keyData.usedByIp) updatePayload.usedByIp = clientIp;
+    if (Object.keys(updatePayload).length > 0) {
+      await firebasePatch(`/proxyAndroid/keys/${cleanKey}`, updatePayload);
+    }
+    keyCache.set(cleanKey, { status: 'active', timestamp: now, usedByIp: keyData.usedByIp || clientIp });
+    return { status: 'active' };
+  }
+  keyCache.set(cleanKey, { status: 'not_found', timestamp: now });
+  return { status: 'not_found' };
+}
+
+// ============================================================
+// ====================== GEO / DISCORD =======================
+// ============================================================
 function getGeoInfo(ip) {
   return new Promise((resolve) => {
     if (!ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168') || ip.startsWith('10.')) return resolve(null);
@@ -135,21 +226,16 @@ function sendDiscordWebhook(payload) {
 async function notifyDiscordLogin(req, key, clientIp, gpsData) {
   try {
     const geo = await getGeoInfo(clientIp);
-    const ua = req.headers['user-agent'] || 'Desconhecido';
     const dataHora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Manaus' });
     let localStr = 'Não disponível';
     if (geo && geo.status === 'success') {
-      const cityName = geo.city || '-';
-      const regName = geo.regionName || '-';
-      const countryName = geo.country || '-';
-      const countryCode = geo.countryCode || '-';
-      localStr = cityName + ' / ' + regName + ' / ' + countryName + ' (' + countryCode + ')';
+      localStr = (geo.city || '-') + ' / ' + (geo.regionName || '-') + ' / ' + (geo.country || '-');
     }
     const fields = [
       { name: "🔑 Key Utilizada", value: "`" + key + "`", inline: false },
       { name: "🌐 IP", value: "`" + clientIp + "`", inline: true },
       { name: "🕒 Data/Hora", value: "`" + dataHora + "`", inline: true },
-      { name: "📍 Localização IP", value: localStr, inline: false }
+      { name: "📍 Localização", value: localStr, inline: false }
     ];
     const embed = {
       username: "SECURE PANEL • LOGS",
@@ -159,18 +245,9 @@ async function notifyDiscordLogin(req, key, clientIp, gpsData) {
   } catch (e) { console.log('Erro webhook:', e.message); }
 }
 
-async function checkKeyStatus(keyInput, clientIp) {
-  if (!keyInput) return { status: 'not_found' };
-  const cleanKey = String(keyInput).trim().toUpperCase();
-  const keyData = await firebaseGet(`/proxyAndroid/keys/${cleanKey}`);
-  if (!keyData || typeof keyData !== 'object') return { status: 'not_found' };
-  const st = normalizeStatus(keyData.status);
-  if (st === 'paused') return { status: 'paused' };
-  if (st === 'active' || st === 'criada') return { status: 'active' };
-  return { status: 'not_found' };
-}
-
-// ================= CSS & ANIMAÇÕES PROFISSIONAIS =================
+// ============================================================
+// ====================== CSS & UI PROFISSIONAL ===============
+// ============================================================
 const BASE_CSS = `
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box;}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#050505;color:#f4f4f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;overflow-x:hidden;}
@@ -198,6 +275,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .btn-logout{width:100%;height:46px;margin-top:12px;border-radius:12px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-weight:800;text-transform:uppercase;letter-spacing:1px;cursor:pointer;transition:all .2s;}
 .btn-logout:hover{background:rgba(239,68,68,.25);color:#fff;}
 `;
+
+// ============================================================
+// ====================== ROTAS ===============================
+// ============================================================
+app.get('/check-status', async (req, res) => {
+  const clientIp = getClientIp(req);
+  const sess = getSession(req);
+  if (!sess || !sess.key) return res.json({ active: false, reason: 'expired' });
+  const check = await checkKeyStatus(sess.key, clientIp, { skipDeviceCheck: true });
+  if (check.status === 'active') return res.json({ active: true });
+  destroySession(req);
+  return res.json({ active: false, reason: check.status });
+});
 
 app.get('/', async (req, res) => {
   const clientIp = getClientIp(req);
@@ -264,6 +354,8 @@ app.post('/login', async (req, res) => {
     return res.redirect('/');
   } else if (check.status === 'paused') {
     return res.redirect('/?erro=paused');
+  } else if (check.status === 'expired') {
+    return res.redirect('/?erro=expired');
   }
   return res.redirect('/?erro=invalid');
 });
